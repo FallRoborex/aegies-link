@@ -3,6 +3,24 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use uuid::Uuid;
 
+#[derive(Debug)]
+enum PacketType {
+    PlayerPosition      = 0,    // Unreliable - fire and forget
+    GameEvent           = 1,    // reliable - must arrive
+    ChatMessages        = 2,    // reliable - must arrive + ordered 
+}
+
+const FLAG_UNRELIABLE: u8 = 0b0000_0000;
+const FLAG_RELIABLE: u8 = 0b0000_0001;
+const FLAG_ORDERED: u8 = 0b0000_0011;
+
+struct Packet {
+    packet_type:        PacketType,
+    sequence_number:    u32,
+    flags:              u8,
+    payload: Vec<u8> 
+}
+
 struct Client {
     id: Uuid,
     addr: SocketAddr
