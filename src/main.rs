@@ -2,25 +2,26 @@
 
 mod auth;
 mod client;
+mod dashboard;
 mod packet;
 mod rate_limiter;
 mod server;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::sync::{Arc, Arc as StdArc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use auth::HMAC_LEN;
 use client::{Client, ClientState, PendingPacket};
+use dashboard::{DashboardData, EventKind, PlayerInfo, run_dashboard};
 use packet::{Packet, PacketType, FLAG_RELIABLE, FLAG_UNRELIABLE, RETRY_INTERVAL_MS, MAX_RETRIES};
 use rate_limiter::{RateLimiter, POSITION_RATE_LIMIT, MAX_STRIKES};
 use server::ServerState;
 
-// Shared server secret — set AEGIS_SECRET in the environment for production.
 fn shared_secret() -> Vec<u8> {
     std::env::var("AEGIS_SECRET")
         .unwrap_or_else(|_| "aegis-dev-secret".to_string())
@@ -30,8 +31,8 @@ fn shared_secret() -> Vec<u8> {
 // Local enum used to copy auth state out of the HashMap before borrowing mutably.
 enum AuthStatus {
     Unknown,
-    Pending([u8; 16]),       // nonce
-    Authenticated([u8; 32]), // session_key
+    Pending([u8; 16]),
+    Authenticated([u8; 32]),
 }
 
 #[tokio::main]
@@ -44,19 +45,30 @@ async fn main() {
         pending: HashMap::new(),
     }));
 
+    let dash = StdArc::new(StdMutex::new(DashboardData::new()));
+
+    std::thread::spawn({
+        let d = StdArc::clone(&dash);
+        move || run_dashboard(d)
+    });
+
     // --- Retransmit task ---
     let retry_socket = Arc::clone(&socket);
     let retry_state  = Arc::clone(&state);
+    let retry_dash   = StdArc::clone(&dash);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let mut state    = retry_state.lock().await;
+            let mut state     = retry_state.lock().await;
             let mut to_remove = Vec::new();
 
             for (seq, pending) in state.pending.iter_mut() {
                 if pending.sent_at.elapsed().as_millis() as u64 >= RETRY_INTERVAL_MS {
                     if pending.retries >= MAX_RETRIES {
-                        println!("Packet #{seq} to {} gave up", pending.addr);
+                        retry_dash.lock().unwrap().push_event(
+                            EventKind::Warn,
+                            format!("Packet #{seq} to {} gave up", pending.addr),
+                        );
                         to_remove.push(*seq);
                     } else {
                         pending.retries  += 1;
@@ -67,7 +79,6 @@ async fn main() {
             }
             for seq in to_remove { state.pending.remove(&seq); }
 
-            // Evict Pending clients that never completed auth
             state.evict_stale_pending();
         }
     });
@@ -75,6 +86,7 @@ async fn main() {
     // --- 60 fps game-loop: broadcast world snapshot to authenticated clients ---
     let game_socket = Arc::clone(&socket);
     let game_state  = Arc::clone(&state);
+    let game_dash   = StdArc::clone(&dash);
     tokio::spawn(async move {
         let mut tick: u64 = 0;
         loop {
@@ -83,7 +95,6 @@ async fn main() {
 
             let state = game_state.lock().await;
 
-            // Build snapshot body: tick(8) + count(1) + per-player[uuid(16)+x(4)+y(4)]
             let mut body = Vec::new();
             body.extend_from_slice(&tick.to_be_bytes());
 
@@ -98,7 +109,6 @@ async fn main() {
                 body.extend_from_slice(&c.y.to_be_bytes());
             }
 
-            // Wrap in a Packet header and send to every authenticated client
             let mut pkt = Vec::new();
             pkt.push(PacketType::Snapshot as u8);
             pkt.extend_from_slice(&(tick as u32).to_be_bytes());
@@ -109,8 +119,18 @@ async fn main() {
                 let _ = game_socket.send_to(&pkt, c.addr).await;
             }
 
-            if tick % 60 == 0 {
-                println!("Tick {tick} | Players online {}", auth_clients.len());
+            if tick % 10 == 0 {
+                let players: Vec<PlayerInfo> = auth_clients.iter().map(|c| PlayerInfo {
+                    id:      c.id.to_string(),
+                    addr:    c.addr.to_string(),
+                    x:       c.x,
+                    y:       c.y,
+                    strikes: c.rate.strikes,
+                }).collect();
+                let pending_count = state.clients.values()
+                    .filter(|c| matches!(c.state, ClientState::Pending { .. }))
+                    .count();
+                game_dash.lock().unwrap().update(tick, players, pending_count);
             }
         }
     });
@@ -128,9 +148,7 @@ async fn main() {
             if text.starts_with("ACK:") {
                 if let Ok(seq) = text[4..].trim().parse::<u32>() {
                     let mut state = state.lock().await;
-                    if state.pending.remove(&seq).is_some() {
-                        println!("ACK #{seq} from {addr}");
-                    }
+                    state.pending.remove(&seq);
                 }
                 continue;
             }
@@ -142,7 +160,7 @@ async fn main() {
             match state.clients.get(&addr) {
                 None => AuthStatus::Unknown,
                 Some(c) => match &c.state {
-                    ClientState::Pending { nonce, .. }       => AuthStatus::Pending(*nonce),
+                    ClientState::Pending { nonce, .. }        => AuthStatus::Pending(*nonce),
                     ClientState::Authenticated { session_key } => AuthStatus::Authenticated(*session_key),
                 },
             }
@@ -154,11 +172,14 @@ async fn main() {
                 let packet = match Packet::from_bytes(raw) {
                     Some(p) if matches!(p.packet_type, PacketType::Connection) => p,
                     _ => {
-                        println!("Dropping non-Connection packet from unknown {addr}");
+                        dash.lock().unwrap().push_event(
+                            EventKind::Warn,
+                            format!("Non-Connection from unknown  {addr}  dropped"),
+                        );
                         continue;
                     }
                 };
-                let _ = packet; // Connection payload ignored for now
+                let _ = packet;
 
                 let nonce = auth::generate_nonce();
                 let id    = Uuid::new_v4();
@@ -176,19 +197,20 @@ async fn main() {
                     id,
                     addr,
                     last_seq: 0,
-                    x:        0.0,
-                    y:        0.0,
-                    state:    ClientState::Pending { nonce, created_at: Instant::now() },
-                    rate:     RateLimiter::new(POSITION_RATE_LIMIT),
+                    x: 0.0, y: 0.0,
+                    state: ClientState::Pending { nonce, created_at: Instant::now() },
+                    rate:  RateLimiter::new(POSITION_RATE_LIMIT),
                 });
-                println!("AuthChallenge → {addr}");
+                dash.lock().unwrap().push_event(
+                    EventKind::Info,
+                    format!("Challenge  {addr}"),
+                );
             }
 
             // ── Pending client: verify AuthResponse ─────────────────────────
             AuthStatus::Pending(nonce) => {
                 let packet = match Packet::from_bytes(raw) {
                     Some(p) if matches!(p.packet_type, PacketType::AuthResponse) => p,
-                    // Allow the client to retry by re-sending Connection
                     Some(p) if matches!(p.packet_type, PacketType::Connection) => {
                         let challenge = Packet {
                             packet_type:     PacketType::AuthChallenge,
@@ -200,7 +222,10 @@ async fn main() {
                         continue;
                     }
                     _ => {
-                        println!("Expected AuthResponse from {addr}, dropping");
+                        dash.lock().unwrap().push_event(
+                            EventKind::Warn,
+                            format!("Expected AuthResponse from {addr}  dropped"),
+                        );
                         continue;
                     }
                 };
@@ -208,7 +233,10 @@ async fn main() {
                 let expected_key = auth::derive_session_key(&secret, &nonce);
 
                 if packet.payload.len() != HMAC_LEN || packet.payload.as_slice() != expected_key {
-                    println!("Auth failed for {addr} — wrong response, evicting");
+                    dash.lock().unwrap().push_event(
+                        EventKind::Warn,
+                        format!("Auth fail  {addr}  wrong secret  evicting"),
+                    );
                     state.lock().await.clients.remove(&addr);
                     continue;
                 }
@@ -221,7 +249,10 @@ async fn main() {
                 }
 
                 let id = state.clients[&addr].id;
-                println!("Auth OK  {addr}  id={id}");
+                dash.lock().unwrap().push_event(
+                    EventKind::Info,
+                    format!("Auth OK  {addr}  id={}", &id.to_string()[..8]),
+                );
 
                 let welcome = Packet {
                     packet_type:     PacketType::GameEvent,
@@ -242,60 +273,70 @@ async fn main() {
 
             // ── Authenticated client: verify HMAC → rate-limit → dispatch ───
             AuthStatus::Authenticated(session_key) => {
-                // 1. Verify and strip HMAC tag
                 let packet_bytes = match auth::verify_and_strip(&session_key, raw) {
                     Some(b) => b,
                     None => {
-                        println!("HMAC fail from {addr}, dropping");
+                        dash.lock().unwrap().push_event(
+                            EventKind::Warn,
+                            format!("HMAC fail  {addr}  dropped"),
+                        );
                         continue;
                     }
                 };
 
-                // 2. Rate-limit check
                 {
                     let mut state = state.lock().await;
                     if let Some(client) = state.clients.get_mut(&addr) {
                         if !client.rate.allow() {
-                            println!("Rate limit exceeded for {addr} (strikes: {})", client.rate.strikes);
-                            if client.rate.strikes >= MAX_STRIKES {
+                            let strikes = client.rate.strikes;
+                            dash.lock().unwrap().push_event(
+                                EventKind::Warn,
+                                format!("Rate limit  {addr}  strikes={strikes}"),
+                            );
+                            if strikes >= MAX_STRIKES {
                                 state.clients.remove(&addr);
-                                println!("Kicked {addr} for flooding");
+                                dash.lock().unwrap().push_event(
+                                    EventKind::Warn,
+                                    format!("Kicked  {addr}  flooding"),
+                                );
                             }
                             continue;
                         }
                     }
                 }
 
-                // 3. Parse
                 let packet = match Packet::from_bytes(&packet_bytes) {
                     Some(p) => p,
                     None => {
-                        println!("Malformed packet from {addr}, dropping");
+                        dash.lock().unwrap().push_event(
+                            EventKind::Warn,
+                            format!("Malformed packet  {addr}  dropped"),
+                        );
                         continue;
                     }
                 };
 
                 let mut state = state.lock().await;
 
-                // 4. ACK reliable packets
                 if packet.is_reliable() {
-                    let ack = format!("ACK: {}", packet.sequence_number);
+                    let ack = format!("ACK:{}", packet.sequence_number);
                     socket.send_to(ack.as_bytes(), addr).await.unwrap();
                 }
 
-                // 5. Update last_seq
                 if let Some(client) = state.clients.get_mut(&addr) {
                     client.last_seq = packet.sequence_number;
                 }
 
-                // 6. Dispatch
                 match packet.packet_type {
                     PacketType::PlayerPosition => {
                         state.update_position_player(addr, &packet.payload);
                     }
                     PacketType::GameEvent | PacketType::ChatMessages => {
-                        let msg = String::from_utf8_lossy(&packet.payload);
-                        println!("[{addr}] event: {msg}");
+                        let msg = String::from_utf8_lossy(&packet.payload).to_string();
+                        dash.lock().unwrap().push_event(
+                            EventKind::Info,
+                            format!("event  {addr}  {msg}"),
+                        );
                     }
                     _ => {}
                 }

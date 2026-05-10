@@ -9,4 +9,5 @@ uuid  = { version = "1.0", features = ["v4", "v7"] }
 hmac  = "0.12"
 sha2  = "0.10"
 rand  = "0.8"
-# ratatui = "0.29"  → Phase 2 dashboard
+ratatui   = "0.29"
+crossterm = "0.27"
