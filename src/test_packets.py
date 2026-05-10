@@ -2,6 +2,31 @@ import socket
 import struct
 import time
 
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(5)
+addr = ("127.0.0.1", 8080)
+
+# Send connect packet
+header = struct.pack(">BI", 0, 0)
+sock.sendto(header, addr)
+print("Connected - NOT sending any ACK, watching for retries...")
+
+# Just listen and print everything that arrives
+for i in range(20):
+    try:
+        data, _ = sock.recvfrom(1024)
+        if len(data) >= 6:
+            seq = struct.unpack(">I", data[1:5])[0]
+            msg = data[6:].decode()
+            print(f"Received packet seq #{seq}: {msg}")
+        else:
+            print(f"Received: {data.decode()}")
+    except socket.timeout:
+        print("Nothing arrived")
+        break
+
+
 def send_packet(sock, addr, packet_type, seq_num, payload=b"", expect_response=True):
     if isinstance(payload, str):
         payload = payload.encode()
@@ -43,6 +68,19 @@ print("-- Connecting --")
 send_packet(sock, addr, 0, 0)
 
 time.sleep(0.5)
+
+
+# Send a reliable GameEvent but DON'T ACK it
+print("\n-- Sending GameEvent (reliable) - NOT sending ACK --")
+header = struct.pack(">BI", 2, 99)
+packet = header + b"important_event"
+sock.sendto(packet, addr)
+
+# Just wait and watch the server retry
+time.sleep(3)
+print("Done waiting - check server output")
+
+
 
 # Reliable GameEvent
 print("\n-- Sending GameEvent (reliable) --")
