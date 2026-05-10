@@ -15,6 +15,7 @@ pub enum PacketType {
     PlayerPosition      = 1,    // Unreliable - fire and forget
     GameEvent           = 2,    // reliable - must arrive
     ChatMessages        = 3,    // reliable - must arrive + ordered
+    Snapshot            = 4,    // server -> all clients, world states
 }
 
 // Packet Header
@@ -38,6 +39,7 @@ impl Packet {
             1 => PacketType::PlayerPosition,
             2 => PacketType::GameEvent,
             3 => PacketType::ChatMessages,
+            4 => PacketType::Snapshot,
             _ => return None
         };
 
@@ -45,7 +47,8 @@ impl Packet {
             PacketType::Connection    => FLAG_UNRELIABLE,
             PacketType::PlayerPosition => FLAG_UNRELIABLE,
             PacketType::GameEvent     => FLAG_RELIABLE,
-            PacketType::ChatMessages  => FLAG_ORDERED
+            PacketType::ChatMessages  => FLAG_ORDERED, 
+            PacketType::Snapshot      => FLAG_UNRELIABLE,
         };
 
         // Sequence number is 4 bytes (byte 1-4), big endian

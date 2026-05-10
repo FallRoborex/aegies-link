@@ -16,4 +16,7 @@ pub struct Client {
     pub id:         Uuid,
     pub addr:       SocketAddr,
     pub last_seq:   u32,
+    // position in the world
+    pub x:          f32,
+    pub y:          f32,
 }

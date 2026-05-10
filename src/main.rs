@@ -16,6 +16,8 @@ use packet::{Packet, PacketType, FLAG_RELIABLE, RETRY_INTERVAL_MS, MAX_RETRIES};
 use client::{Client, PendingPacket};
 use server::ServerState;
 
+use crate::packet::FLAG_UNRELIABLE;
+
 #[tokio::main]
 async fn main() {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:8080").await.unwrap());
@@ -60,8 +62,51 @@ async fn main() {
         }
     });
 
+    let game_socket = Arc::clone(&socket);
+    let game_state  = Arc::clone(&state);
+
+    tokio::spawn(async  move {
+        let mut tick: u64 = 0;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(16)).await;
+            tick += 1;
+
+            let state = game_state.lock().await;
+
+            // Build snapshop packet
+            // Format: tick(8 bytes) + each player: uuid(16 bytes) + x(4 bytes) + y(4 bytes)
+            let mut snapshot = Vec::new();
+            snapshot.extend_from_slice(&tick.to_be_bytes());
+            snapshot.push(state.clients.len() as u8); 
+
+            for client in state.clients.values() {
+                snapshot.extend_from_slice(client.id.as_bytes());
+                snapshot.extend_from_slice(&client.x.to_be_bytes());
+                snapshot.extend_from_slice(&client.y.to_be_bytes());
+            }
+
+            // Send snapshot to every connected client
+            for client in state.clients.values() {
+                // Build a proper packet
+                let mut packet = Vec::new();
+                packet.push(PacketType::Snapshot as u8);
+                packet.extend_from_slice(&(tick as u32).to_be_bytes());
+                packet.push(FLAG_UNRELIABLE);
+                packet.extend_from_slice(&snapshot);
+
+                let _ = game_socket.send_to(&packet, client.addr).await;
+            }
+
+            if tick % 60 == 0 {
+                println!("Tick {} | Players online {}", tick, state.clients.len());
+            }
+        }
+    });
+
+
+
     // Generate a Unique UID
-    let mut clients: HashMap<SocketAddr, Client> = HashMap::new();
     let mut buf = [0u8; 1024];
 
     loop {
@@ -98,7 +143,7 @@ async fn main() {
             if !state.clients.contains_key(&addr) {
                 let id = Uuid::new_v4();
                 println!("New Client Connected! Assigned ID: {}", id);
-                state.clients.insert(addr, Client { id, addr, last_seq: 0 });
+                state.clients.insert(addr, Client { id, addr, last_seq: 0, x: 0.0, y: 0.0 });
 
                 // Send welcome as a reliable packet
                 let welcome = Packet {
@@ -133,6 +178,10 @@ async fn main() {
 
         if let Some(client) = state.clients.get_mut(&addr) {
             client.last_seq = packet.sequence_number;
+        }
+
+        if matches!(packet.packet_type, PacketType::PlayerPosition) {
+            state.update_position_player(addr, &packet.payload);
         }
 
         let msg = String::from_utf8_lossy(&packet.payload);
