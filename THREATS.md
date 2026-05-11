@@ -72,9 +72,6 @@
 
 | Limitation | Tracked in |
 |---|---|
-| No replay protection (monotonic seq check) | Section 2 above |
 | Server outbound packets unsigned | Section 5 above |
-| No server-side position validation | Section 6 above |
-| Single shared secret (no per-user credentials) | Section 7 above |
 | Welcome packet always uses seq=1 (pending-table collision with multiple simultaneous connects) | Code comment in main.rs |
 | ACK messages are plaintext and unsigend (attacker can fake ACKs to suppress retransmission) | Out of scope for this phase |
