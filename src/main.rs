@@ -90,43 +90,58 @@ async fn main() {
     tokio::spawn(async move {
         let mut tick: u64 = 0;
         loop {
-            tokio::time::sleep(Duration::from_millis(16)).await;
+            tokio::time::sleep(Duration::from_millis(8)).await;
             tick += 1;
 
             let state = game_state.lock().await;
 
-            let mut body = Vec::new();
-            body.extend_from_slice(&tick.to_be_bytes());
-
+            // Collect (addr, session_key) so we can sign per-client
             let auth_clients: Vec<_> = state.clients.values()
-                .filter(|c| matches!(c.state, ClientState::Authenticated { .. }))
+                .filter_map(|c|
+                if let ClientState::Authenticated { session_key } = c.state {
+                    Some((c.id, c.addr, c.x, c.y, session_key))
+                } else {
+                    None
+                })
                 .collect();
 
+            // Build the snapshot body
+            let mut body = Vec::new();
+            body.extend_from_slice(&tick.to_be_bytes());
             body.push(auth_clients.len() as u8);
-            for c in &auth_clients {
-                body.extend_from_slice(c.id.as_bytes());
-                body.extend_from_slice(&c.x.to_be_bytes());
-                body.extend_from_slice(&c.y.to_be_bytes());
+            for (id, _, x, y, _) in &auth_clients {
+                body.extend_from_slice(id.as_bytes());
+                body.extend_from_slice(&x.to_be_bytes());
+                body.extend_from_slice(&y.to_be_bytes());
             }
 
-            let mut pkt = Vec::new();
-            pkt.push(PacketType::Snapshot as u8);
-            pkt.extend_from_slice(&(tick as u32).to_be_bytes());
-            pkt.push(FLAG_UNRELIABLE);
-            pkt.extend_from_slice(&body);
+            for (_, addr, _, _, session_key) in &auth_clients {
+                let mut pkt = Vec::new();
+                pkt.push(PacketType::Snapshot as u8);
+                pkt.extend_from_slice(&(tick as u32).to_be_bytes());
+                pkt.push(FLAG_UNRELIABLE);
+                pkt.extend_from_slice(&body);
 
-            for c in &auth_clients {
-                let _ = game_socket.send_to(&pkt, c.addr).await;
+                let signed = auth::sign(session_key, &pkt);
+                let _ = game_socket.send_to(&signed, addr).await;
             }
 
             if tick % 10 == 0 {
-                let players: Vec<PlayerInfo> = auth_clients.iter().map(|c| PlayerInfo {
-                    id:      c.id.to_string(),
-                    addr:    c.addr.to_string(),
-                    x:       c.x,
-                    y:       c.y,
-                    strikes: c.rate.strikes,
-                }).collect();
+                let players: Vec<PlayerInfo> = state.clients.values()
+                    .filter_map(|c| {
+                        if matches!(c.state, ClientState::Authenticated { .. }) {
+                            Some(PlayerInfo {
+                                id:      c.id.to_string(),
+                                addr:    c.addr.to_string(),
+                                x:       c.x,
+                                y:       c.y,
+                                strikes: c.rate.strikes,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 let pending_count = state.clients.values()
                     .filter(|c| matches!(c.state, ClientState::Pending { .. }))
                     .count();
@@ -318,14 +333,23 @@ async fn main() {
 
                 let mut state = state.lock().await;
 
+                if let Some(client) = state.clients.get_mut(&addr) {
+                    if packet.sequence_number <= client.last_seq && client.last_seq != 0 {
+                        dash.lock().unwrap().push_event(
+                            EventKind::Warn,
+                            format!("Replay detected  {addr}  seq={}", packet.sequence_number),
+                        );
+                        continue;
+                    }
+                    client.last_seq = packet.sequence_number;
+                }
+
+                // ACK only after replay check — replayed packets are silently dropped, not ACK'd.
                 if packet.is_reliable() {
                     let ack = format!("ACK:{}", packet.sequence_number);
                     socket.send_to(ack.as_bytes(), addr).await.unwrap();
                 }
-
-                if let Some(client) = state.clients.get_mut(&addr) {
-                    client.last_seq = packet.sequence_number;
-                }
+                
 
                 match packet.packet_type {
                     PacketType::PlayerPosition => {
