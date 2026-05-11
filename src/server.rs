@@ -6,6 +6,8 @@ use std::time::Duration;
 use crate::client::{Client, ClientState, PendingPacket};
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SPEED: f32 = 500.0;               // units per sec
+const MAX_DELTA: f32 = MAX_SPEED / 60.0;    // ~ 8.3 unites per tick at 60 fps
 
 pub struct ServerState {
     pub clients: HashMap<SocketAddr, Client>,
@@ -33,6 +35,12 @@ impl ServerState {
                     let x_str = parts[0].trim().trim_start_matches("x:");
                     let y_str = parts[1].trim().trim_start_matches("y:");
                     if let (Ok(x), Ok(y)) = (x_str.parse::<f32>(), y_str.parse::<f32>()) {
+                        // Simple implementaion: Needs to allow cases like teleporting on the map 
+                        let dx = x - client.x;
+                        let dy = x - client.y;
+                        if (dx * dx + dy * dy).sqrt() > MAX_DELTA {
+                            return; // reject - too far to move in one tick
+                        }
                         client.x = x;
                         client.y = y;
                     }
