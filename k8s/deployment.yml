@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-link
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aegis-link
+  template:
+    metadata:
+      labels:
+        app: aegis-link
+    spec:
+      containers:
+        - name: aegis-link
+          image: localhost:5000/aegis-link:local
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              protocol: UDP
+          env:
+            - name: AEGIS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: aegis-link-secret
+                  key: AEGIS_SECRET

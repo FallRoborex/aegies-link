@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-link
+spec:
+  selector:
+    app: aegis-link
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: UDP
+      nodePort: 30080
+  type: NodePort
