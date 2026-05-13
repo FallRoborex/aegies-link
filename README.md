@@ -103,6 +103,21 @@ Each snapshot is signed individually per client using that client's session key.
 
 ---
 
+## Kubernetes — known limitation: UDP session affinity
+
+Kubernetes Services support `sessionAffinity: ClientIP` for TCP, which pins a client to the same Pod across requests. **This does not work for UDP.** The kube-proxy iptables rules that implement session affinity only track TCP connections; UDP packets have no connection state, so kube-proxy cannot maintain the mapping.
+
+Consequence: in a multi-replica Deployment, a given client's UDP packets may be load-balanced to different Pods across packets. Since `ServerState` is in-process memory, different Pods have no shared view of authenticated clients — a player authenticated on Pod A will be treated as a stranger by Pod B.
+
+**Workarounds (not implemented here):**
+
+- **Single replica** — simplest; no cross-Pod state problem. The current deployment uses this.
+- **External shared state** — move `ServerState` into Redis or a similar store. Pods become stateless. Adds latency and operational complexity.
+- **Consistent hashing at the load balancer** — some cloud load balancers (AWS NLB, GCP UDP LB) can hash on `(src_ip, src_port)` to pin a UDP client to a fixed backend. Requires a cloud-managed LB, not stock K8s.
+- **StatefulSet + client-side routing** — each Pod is a named, stable game room; clients are told which Pod to target at connection time. This is the architecture real game backends use (e.g. Agones).
+
+---
+
 ## Module layout
 
 ```

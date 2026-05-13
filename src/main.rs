@@ -47,10 +47,14 @@ async fn main() {
 
     let dash = StdArc::new(StdMutex::new(DashboardData::new()));
 
-    std::thread::spawn({
-        let d = StdArc::clone(&dash);
-        move || run_dashboard(d)
-    });
+    let headless =std::env::args().any(|a| a == "--headless") || std::env::var("AEGIS_HEADLESS").is_ok();
+
+    if !headless {
+        std::thread::spawn({
+            let d = StdArc::clone(&dash);
+            move || run_dashboard(d)
+        });
+    }
 
     // --- Retransmit task ---
     let retry_socket = Arc::clone(&socket);
